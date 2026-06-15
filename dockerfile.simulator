@@ -1,0 +1,15 @@
+FROM rust:alpine AS builder
+RUN apk add --no-cache musl-dev pkgconfig openssl-libs-static openssl-dev
+WORKDIR /usr/src/app
+COPY Cargo.lock .
+COPY Cargo.toml .
+COPY realtime realtime
+COPY shared shared
+COPY signalr signalr
+COPY api api
+COPY simulator simulator
+RUN cargo build -r -p simulator
+
+FROM alpine:3
+COPY --from=builder /usr/src/app/target/release/simulator /simulator
+ENTRYPOINT ["/simulator"]

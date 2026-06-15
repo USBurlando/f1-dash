@@ -65,7 +65,8 @@ async fn negotiate(base_url: &str) -> Result<Negotiation, anyhow::Error> {
 
     let negotiation: NegotiationResponse = serde_json::from_str(&body).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse negotiate response: {e} — body: {}",
+            "Failed to parse negotiate response: {} - body: {}",
+            e,
             &body[..body.len().min(300)]
         )
     })?;
@@ -78,6 +79,29 @@ async fn negotiate(base_url: &str) -> Result<Negotiation, anyhow::Error> {
     })
 }
 
+async fn negotiate_http(base_url: &str) -> Result<Negotiation, anyhow::Error> {
+    // Like negotiate() but uses http:// instead of https:// for local simulator
+    let negotiate_url = format!("http://{}/negotiate", base_url);
+    let client = reqwest::Client::new();
+
+    let url = Url::parse_with_params(&negotiate_url, &[("negotiateVersion", "1")])?;
+    let res = client.post(url).send().await?;
+    let body = res.text().await?;
+
+    if body.trim().is_empty() {
+        return Err(anyhow::anyhow!("Negotiate returned empty response"));
+    }
+
+    let negotiation: NegotiationResponse = serde_json::from_str(&body).map_err(|e| {
+        anyhow::anyhow!("Failed to parse negotiate response: {} - body: {}", e, &body[..body.len().min(300)])
+    })?;
+
+    Ok(Negotiation {
+        connection_token: negotiation.connection_token,
+        cookie: String::new(),
+    })
+}
+
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -86,16 +110,27 @@ pub struct SignalrClient {
 }
 
 pub async fn create_client(base_url: &str, _hub: &str) -> Result<SignalrClient, anyhow::Error> {
-    let negotiation = negotiate(base_url).await?;
-
-    let mut ws_url = Url::parse(&format!("wss://{}", base_url))?;
-    if let Some(ref token) = negotiation.connection_token {
-        ws_url.query_pairs_mut().append_pair("id", token);
-    }
-
-    let ws_url = match env::var_os("F1_DEV_URL") {
-        Some(env_url) => Url::from_str(&env_url.into_string().unwrap())?,
-        None => ws_url,
+    // If F1_DEV_URL is set, negotiate against the local simulator instead of F1
+    let (ws_url, cookie) = match env::var_os("F1_DEV_URL") {
+        Some(env_url) => {
+            let dev_ws_url = env_url.into_string().unwrap();
+            // Derive http negotiate base from ws:// URL (e.g. ws://localhost:4000/ws -> localhost:4000)
+            let negotiate_base = dev_ws_url
+                .trim_start_matches("ws://")
+                .trim_start_matches("wss://")
+                .trim_end_matches("/ws")
+                .to_string();
+            let _neg = negotiate_http(&negotiate_base).await?;
+            (Url::from_str(&dev_ws_url)?, String::new())
+        }
+        None => {
+            let negotiation = negotiate(base_url).await?;
+            let mut url = Url::parse(&format!("wss://{}", base_url))?;
+            if let Some(ref token) = negotiation.connection_token {
+                url.query_pairs_mut().append_pair("id", token);
+            }
+            (url, negotiation.cookie)
+        }
     };
 
     info!("connecting to {ws_url}");
@@ -108,8 +143,8 @@ pub async fn create_client(base_url: &str, _hub: &str) -> Result<SignalrClient, 
         header::ACCEPT_ENCODING,
         HeaderValue::from_static("gzip,identity"),
     );
-    if !negotiation.cookie.is_empty() {
-        headers.insert(header::COOKIE, negotiation.cookie.parse()?);
+    if !cookie.is_empty() {
+        headers.insert(header::COOKIE, cookie.parse()?);
     }
 
     let (mut stream, res) = tokio_tungstenite::connect_async(req).await?;
