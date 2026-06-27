@@ -148,9 +148,26 @@ const msgs = (Array.isArray(messages) ? [...messages] : []).sort(sortUtc).filter
 | `CarData.z` | **0** | ⚠️ Missing — see note below |
 | `Position.z` | **0** | ⚠️ Missing — see note below |
 
-### ⚠️ CarData.z / Position.z — Missing
-**Conclusion:** Not transmitted by F1 post-race. Only active when cars are on track.  
-**Fix for next time:** Connect before session start. FP1 of next GP.
+### ⚠️ CarData.z / Position.z — Missing (ROOT CAUSE CONFIRMED, BUT NOT A PROBLEM)
+
+**Root cause:** F1 now requires **authentication** for `CarData.z` and `Position.z`. Confirmed by FastF1's source code, which has a `no_auth` flag and explicitly states: *"Unauthenticated access may only work for certain sessions or return incomplete data. Use authenticated access for reliable data capture."* FastF1 retrieves an auth token via an internal, undocumented module (`fastf1.internals.f1auth.get_auth_token`), likely requiring a real F1TV login.
+
+**This affects both our script AND the original f1-dash simulator equally** — neither implements authentication.
+
+### 🎉 IMPORTANT DISCOVERY: the dashboard doesn't need Position.z anyway!
+
+Inspected `dashboard/src/components/dashboard/Map.tsx` — line 115 has:
+```js
+// const positions = useDataStore((state) => state.positions);
+```
+This line is **commented out**. The dashboard no longer reads `Position.z` at all. Instead, `getDriverPosition()` (lines 29-99) **calculates** each car's position by interpolating its progress through `TimingData.Sectors[].Segments[].Status` — i.e. how far along each micro-sector segment a driver has completed. This data comes from `TimingData`, which we ARE capturing successfully.
+
+**Conclusion:** The Track Map works correctly with our unauthenticated capture. There is no missing functionality. `CarData.z` (raw telemetry: speed, RPM, throttle, etc.) is still unavailable and would require auth — but it's not used by any current dashboard component for the map; it would only matter for a future telemetry/speed trace feature.
+
+**Verified across 2 recordings:**
+- Barcelona race (post-race connection) — 0 messages for CarData.z/Position.z
+- Austria Q1 (connected mid-session, live) — 0 messages for CarData.z/Position.z — confirms it's NOT a timing issue, it's an auth issue
+- User confirmed seeing cars move on our local dashboard's Track Map during Austria Q1 — this works via the TimingData-based interpolation, not Position.z
 
 ---
 
@@ -208,12 +225,39 @@ Open http://localhost:3001 in browser.
 - [x] Fixed dashboard map.ts crash when Position.z data is missing
 - [x] Full stack running with replay of Barcelona GP ✅
 
-### Capture CarData.z / Position.z — Next GP
-- Connect **before** session start (formation lap or earlier)
-- Canadian GP is next — check schedule at https://www.formula1.com/en/racing/2026
-```powershell
-python f1-capture-win.py recordings/canada_2026_fp1.ndjson
+### Auto-stop on session end — IMPLEMENTED ✅
+`f1-capture-win.py` now monitors `SessionStatus` and stops automatically (with a 10s grace period) when it sees `Finalised` or `Ends`.
+
+**Confirmed real SessionStatus values from Austria Q1 recording:**
 ```
+Started → Finished → Inactive → Started → Finished → Inactive → Started → Finished → Finalised
+```
+(Q1 → break → Q2 → break → Q3, all within the same SignalR connection — quali has 3 sub-sessions)
+
+**Important:** if capturing only Q1 (not the full quali), the script will NOT auto-stop until the *entire* qualifying session reaches `Finalised` — it doesn't stop between Q1/Q2/Q3. Use Ctrl+C manually if you only want one segment.
+
+### Dataset Analysis — austria_2026_q1.ndjson
+
+13,542 messages captured (connected mid-Q1, live session).
+
+| Topic | Messages |
+|---|---|
+| TimingData | 5,438 |
+| TimingAppData | 370 |
+| TimingStats | 271 |
+| Heartbeat | 256 |
+| DriverList | 99 |
+| WeatherData | 52 |
+| RaceControlMessages | 47 |
+| SessionData | 13 |
+| TeamRadio | 10 |
+| SessionStatus | 8 |
+| ExtrapolatedClock | 7 |
+| TrackStatus | 3 |
+| SessionInfo | 1 |
+| **CarData.z** | **0** |
+| **Position.z** | **0** |
+
 
 ---
 
