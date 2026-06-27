@@ -25,8 +25,15 @@ TOPICS = [
 ]
 HEADERS = {"User-Agent": "BestHTTP", "Accept-Encoding": "gzip, identity"}
 
+# Statuses that mean "a segment just ended" (could be end of Q1, end of session, etc.)
+SEGMENT_END_STATUSES = ("Finished", "Inactive", "Finalised", "Ends", "Aborted")
+# Statuses that mean "the whole session is fully done" — stop capturing entirely
+SESSION_DONE_STATUSES = ("Finalised", "Ends")
+
+
 def now():
     return datetime.now().strftime("%H:%M:%S")
+
 
 def negotiate():
     url = f"https://{BASE_URL}/negotiate"
@@ -42,6 +49,59 @@ def negotiate():
     data = res.json()
     token = data.get("connectionToken") or data.get("connectionId")
     return token, cookie
+
+
+class SegmentWriter:
+    """Writes capture data to numbered segment files: base_seg1.ndjson, base_seg2.ndjson, ...
+    Starts a new segment file every time SessionStatus goes Started -> Finished/Inactive -> Started again.
+    If only one segment ever happens, the file is renamed to just base.ndjson at the end (no suffix).
+    """
+
+    def __init__(self, base_path: Path):
+        self.base_path = base_path
+        self.stem = base_path.stem
+        self.suffix = base_path.suffix
+        self.parent = base_path.parent
+        self.segment_num = 0
+        self.file = None
+        self.path = None
+        self.total_count = 0
+        self.segment_count = 0
+
+    def _path_for(self, n):
+        return self.parent / f"{self.stem}_seg{n}{self.suffix}"
+
+    def start_segment(self, initial_state):
+        if self.file:
+            self.close_segment()
+        self.segment_num += 1
+        self.path = self._path_for(self.segment_num)
+        self.file = open(self.path, "w", encoding="utf-8")
+        self.file.write(json.dumps(initial_state) + "\n")
+        self.segment_count = 0
+        print(f"[{now()}] >>> Segment {self.segment_num} started -> {self.path.name}")
+
+    def write(self, raw):
+        if self.file:
+            self.file.write(raw + "\n")
+            self.segment_count += 1
+            self.total_count += 1
+
+    def close_segment(self):
+        if self.file:
+            self.file.close()
+            print(f"[{now()}] <<< Segment {self.segment_num} closed: {self.segment_count} messages -> {self.path.name}")
+            self.file = None
+
+    def finalize(self):
+        self.close_segment()
+        if self.segment_num <= 1:
+            # Only one segment total -> rename to the plain requested filename
+            single_path = self._path_for(1)
+            if single_path.exists():
+                single_path.rename(self.base_path)
+                print(f"[{now()}] Single segment renamed to {self.base_path.name}")
+
 
 async def capture(output_path: Path):
     print(f"[{now()}] Negotiating...")
@@ -79,35 +139,74 @@ async def capture(output_path: Path):
                         raise RuntimeError(f"Subscribe error: {msg['error']}")
                     initial_state = msg.get("result", {})
 
-        count = 0
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(initial_state) + "\n")
-            print(f"[{now()}] Initial state saved. Capturing... (Ctrl+C to stop)\n")
-            try:
-                async for raw in ws:
-                    f.write(raw + "\n")
-                    count += 1
-                    if count % 50 == 0:
-                        topics = set()
-                        for frame in raw.split(RECORD_SEP):
-                            frame = frame.strip()
-                            if not frame:
-                                continue
-                            try:
-                                msg = json.loads(frame)
-                                if msg.get("target") == "feed" and msg.get("arguments"):
-                                    topics.add(msg["arguments"][0])
-                            except Exception:
-                                pass
-                        print(f"[{now()}] {count} msgs | {', '.join(topics) or 'heartbeat'}")
-            except (KeyboardInterrupt, asyncio.CancelledError):
-                pass
+        writer = SegmentWriter(output_path)
+        writer.start_segment(initial_state)
 
-        print(f"\n[{now()}] Done. {count} messages saved to {output_path}")
+        # Track current/last SessionStatus to detect transitions
+        last_status = None
+        # If initial_state already has a SessionStatus, use it as starting point
+        try:
+            last_status = initial_state.get("SessionStatus", {}).get("Status")
+        except Exception:
+            pass
+
+        session_done = False
+
+        print(f"[{now()}] Capturing... (Ctrl+C to stop manually at any time)\n")
+        try:
+            async for raw in ws:
+                writer.write(raw)
+
+                topics = set()
+                for frame in raw.split(RECORD_SEP):
+                    frame = frame.strip()
+                    if not frame:
+                        continue
+                    try:
+                        msg = json.loads(frame)
+                        if msg.get("target") == "feed" and msg.get("arguments"):
+                            topic, data = msg["arguments"][0], msg["arguments"][1]
+                            topics.add(topic)
+
+                            if topic == "SessionStatus":
+                                status = data.get("Status") if isinstance(data, dict) else data
+
+                                # New segment starting: previous was an end-state, now back to Started
+                                if status == "Started" and last_status in SEGMENT_END_STATUSES:
+                                    writer.start_segment(initial_state={"SessionStatus": {"Status": "Started"}})
+
+                                # Whole session truly done
+                                if status in SESSION_DONE_STATUSES:
+                                    print(f"\n[{now()}] SessionStatus='{status}' — session fully ended, stopping in 10s...")
+                                    session_done = True
+
+                                last_status = status
+                    except Exception:
+                        pass
+
+                if writer.total_count % 50 == 0:
+                    print(f"[{now()}] {writer.total_count} total msgs (segment {writer.segment_num}: {writer.segment_count}) | {', '.join(topics) or 'heartbeat'}")
+
+                if session_done:
+                    try:
+                        for _ in range(10):
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                            writer.write(raw)
+                    except asyncio.TimeoutError:
+                        pass
+                    break
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
+
+        writer.finalize()
+        print(f"\n[{now()}] Done. {writer.total_count} total messages across {writer.segment_num} segment(s).")
+
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python f1-capture.py <output.ndjson>")
+        print("Usage: python f1-capture-win.py <output.ndjson>")
+        print("If the session has multiple parts (e.g. Quali Q1/Q2/Q3),")
+        print("files will be saved as <output>_seg1.ndjson, _seg2.ndjson, etc.")
         sys.exit(1)
     output_path = Path(sys.argv[1])
     if output_path.exists():
@@ -119,6 +218,7 @@ def main():
     except RuntimeError as e:
         print(f"\nError: {e}")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
