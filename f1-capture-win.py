@@ -142,14 +142,16 @@ async def capture(output_path: Path):
         writer = SegmentWriter(output_path)
         writer.start_segment(initial_state)
 
-        # Track current/last SessionStatus to detect transitions
+        # Track current/last SessionStatus to detect transitions.
+        # IMPORTANT: we only treat a "Started" as the beginning of a NEW
+        # segment if we have already seen at least one prior SessionStatus
+        # update come through the LIVE feed (not the initial snapshot), and
+        # that prior status was a genuine end-state. This avoids a false
+        # split being triggered by the very first SessionStatus message of
+        # the connection (which is just confirming the current/ongoing
+        # session, not announcing a transition).
         last_status = None
-        # If initial_state already has a SessionStatus, use it as starting point
-        try:
-            last_status = initial_state.get("SessionStatus", {}).get("Status")
-        except Exception:
-            pass
-
+        seen_any_status = False
         session_done = False
 
         print(f"[{now()}] Capturing... (Ctrl+C to stop manually at any time)\n")
@@ -171,16 +173,19 @@ async def capture(output_path: Path):
                             if topic == "SessionStatus":
                                 status = data.get("Status") if isinstance(data, dict) else data
 
-                                # New segment starting: previous was an end-state, now back to Started
-                                if status == "Started" and last_status in SEGMENT_END_STATUSES:
+                                # Only split if we've already seen a previous
+                                # status AND that previous status was a
+                                # genuine end-state (not on the very first
+                                # status message received).
+                                if seen_any_status and status == "Started" and last_status in SEGMENT_END_STATUSES:
                                     writer.start_segment(initial_state={"SessionStatus": {"Status": "Started"}})
 
-                                # Whole session truly done
                                 if status in SESSION_DONE_STATUSES:
                                     print(f"\n[{now()}] SessionStatus='{status}' — session fully ended, stopping in 10s...")
                                     session_done = True
 
                                 last_status = status
+                                seen_any_status = True
                     except Exception:
                         pass
 
